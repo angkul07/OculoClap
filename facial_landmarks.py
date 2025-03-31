@@ -12,14 +12,11 @@ FACIAL_LANDMARKS_IDXS = OrderedDict([
 ])
 
 def eye_aspect_ratio(eye):
-    # Calculate vertical distances
     vertical1_dist = np.linalg.norm(eye[1] - eye[5])
     vertical2_dist = np.linalg.norm(eye[2] - eye[4])
 
-    # Calculate horizontal distance
     horizontal_dist = np.linalg.norm(eye[0] - eye[3])
 
-    # Compute eye aspect ratio
     ear = (vertical1_dist + vertical2_dist) / (2.0 * horizontal_dist)
     return ear
 

@@ -3,73 +3,116 @@ import dlib
 import numpy as np
 from threading import Thread
 import playsound
-# from facial_landmarks import calc_ear, lip_distance
-from collections import OrderedDict
+import pyaudio
+import time
+import audioop
+from facial_landmarks import calc_ear, lip_distance
 
 # Constants
 EAR_THRESHOLD = 0.25
 EAR_CONSEC_FRAMES = 30
 YAWN_THRESHOLD = 23
+CLAP_THRESHOLD = 1  
+CLAP_COOLDOWN = 10  # Frames to wait between clap detections
+
+# Clap detection parameters - more sensitive defaults
+CHUNK = 1024  # Smaller chunk size for better temporal resolution
+RATE = 16000  # Lower sample rate focusing on audible range
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+CLAP_ENERGY_THRESHOLD = 0.08  # Starting threshold - it will be calibrated
+CLAP_DYNAMIC_ADJUSTMENT = 1.5  # Used to multiply background noise level
+
 alarm_status = False
 alarm_status2 = False
 COUNTER = 0
-saying = False
+clap_count = 0
+clap_cooldown = 0
+background_noise = 0
 
-def alarm(path="CV/lazy_detect/alarm_audio.mp3"):
+def continuous_alarm(path="alarm_audio.wav"):
+    """Function to play alarm continuously until stopped"""
+    global alarm_status, alarm_status2
+    while alarm_status or alarm_status2:
+        playsound.playsound(path)
+        time.sleep(0.1)
+
+def single_alarm(path="alarm_audio.wav"):
     playsound.playsound(path)
 
-FACIAL_LANDMARKS_IDXS = OrderedDict([
-    ("mouth", (48, 68)),
-    ("right_eyebrow", (17, 22)),
-    ("left_eyebrow", (22, 27)),
-    ("right_eye", (36, 42)),
-    ("left_eye", (42, 48)),
-    ("nose", (27, 36)),
-    ("jaw", (0, 17))
-])
+# Set up audio for clap detection
+def setup_audio():
+    p = pyaudio.PyAudio()
+    stream = p.open(
+        format=FORMAT,
+        channels=CHANNELS,
+        rate=RATE,
+        input=True,
+        frames_per_buffer=CHUNK
+    )
+    return p, stream
 
-def eye_aspect_ratio(eye):
-    # Calculate vertical distances
-    vertical1_dist = np.linalg.norm(eye[1] - eye[5])
-    vertical2_dist = np.linalg.norm(eye[2] - eye[4])
-
-    # Calculate horizontal distance
-    horizontal_dist = np.linalg.norm(eye[0] - eye[3])
-
-    # Compute eye aspect ratio
-    ear = (vertical1_dist + vertical2_dist) / (2.0 * horizontal_dist)
-    return ear
-
-def calc_ear(landmarks):
-    (lstart, lend) = FACIAL_LANDMARKS_IDXS["left_eye"]
-    (rstart, rend) = FACIAL_LANDMARKS_IDXS["right_eye"]
-
-    leftEye = landmarks[lstart:lend]
-    rightEye = landmarks[rstart:rend]
-
-    leftEAR = eye_aspect_ratio(leftEye)
-    rightEAR = eye_aspect_ratio(rightEye)
+def calibrate_background_noise(stream, samples=50):
+    """Measure the background noise level to dynamically set clap threshold"""
+    print("Calibrating background noise... Please be quiet.")
     
-    ear = (leftEAR + rightEAR) / 2.0
-    return (ear, leftEye, rightEye)
+    # Collect multiple samples
+    noise_levels = []
+    for _ in range(samples):
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        rms = audioop.rms(data, 2)  # Get RMS value
+        normalized_rms = rms / 32767.0  # Normalize
+        noise_levels.append(normalized_rms)
+        time.sleep(0.02)  # Short delay between measurements
+        
+    # Calculate average noise level
+    avg_noise = sum(noise_levels) / len(noise_levels)
+    threshold = avg_noise * CLAP_DYNAMIC_ADJUSTMENT
+    
+    print(f"Background noise: {avg_noise:.6f}")
+    print(f"Clap threshold set to: {threshold:.6f}")
+    
+    return avg_noise, threshold
 
-def lip_distance(landmarks):
-    top_lip = landmarks[50:53]
-    top_lip = np.concatenate((top_lip, landmarks[61:64]))
+def detect_clap(stream, threshold, prev_energy=0):
+    """Improved clap detection using energy delta"""
+    data = stream.read(CHUNK, exception_on_overflow=False)
+    
+    # Use audioop module for more efficient RMS calculation
+    rms = audioop.rms(data, 2)
+    
+    # Normalize
+    current_energy = rms / 32767.0
+    
+    # Look for a rapid increase in energy followed by decrease (typical of claps)
+    energy_delta = abs(current_energy - prev_energy)
+    
+    # Check if energy exceeds threshold and we have a significant change
+    if current_energy > threshold and energy_delta > threshold * 0.5:
+        return True, current_energy
+    
+    return False, current_energy
 
-    low_lip = landmarks[56:59]
-    low_lip = np.concatenate((low_lip, landmarks[65:68]))
-
-    top_mean = np.mean(top_lip, axis=0)
-    low_mean = np.mean(low_lip, axis=0)
-
-    distance = abs(top_mean[1] - low_mean[1])
-    return distance
-
+# Initialize
 detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("CV/lazy_detect/shape_predictor_68_face_landmarks.dat")
+predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+
+# Initialize audio for clap detection
+p, audio_stream = setup_audio()
+
+# Calibrate the microphone for background noise
+background_noise, clap_threshold = calibrate_background_noise(audio_stream)
 
 cap = cv2.VideoCapture(0)
+
+# Variable to store previous energy level for delta calculation
+prev_energy = 0
+
+# Flag for continuous alarm thread
+alarm_thread_running = False
+
+print(f"Clap detection ready. Threshold: {clap_threshold}")
+print("Starting capture...")
 
 while True:
     ret, frame = cap.read()
@@ -78,6 +121,45 @@ while True:
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     rects = detector(gray, 0)
+    
+    # Check for claps if alarm is active
+    if alarm_status or alarm_status2:
+        # Start continuous alarm thread if not already running
+        if not alarm_thread_running:
+            t = Thread(target=continuous_alarm)
+            t.daemon = True
+            t.start()
+            alarm_thread_running = True
+            
+        if clap_cooldown <= 0:
+            clap_detected, prev_energy = detect_clap(audio_stream, clap_threshold, prev_energy)
+            if clap_detected:
+                clap_count += 1
+                clap_cooldown = CLAP_COOLDOWN
+                print(f"Clap detected! Count: {clap_count}/{CLAP_THRESHOLD}")
+        else:
+            # Just update the previous energy value
+            _, prev_energy = detect_clap(audio_stream, clap_threshold, prev_energy)
+
+        # If enough claps, dismiss the alarm
+        if clap_count >= CLAP_THRESHOLD:
+            alarm_status = False
+            alarm_status2 = False
+            COUNTER = 0
+            clap_count = 0
+            alarm_thread_running = False
+            print("Alarm dismissed by claps!")
+    else:
+        # Reset clap count when no alarm is active
+        clap_count = 0
+        alarm_thread_running = False
+        
+        # Still update the energy level for better detection when alarm activates
+        _, prev_energy = detect_clap(audio_stream, clap_threshold, prev_energy)
+    
+    # Decrease cooldown counter
+    if clap_cooldown > 0:
+        clap_cooldown -= 1
 
     for rect in rects:
         # Get the bounding box coordinates
@@ -115,37 +197,49 @@ while True:
             if COUNTER >= EAR_CONSEC_FRAMES:
                 if not alarm_status:
                     alarm_status = True
-                    t = Thread(target=alarm)
-                    t.daemon = True
-                    t.start()
                 cv2.putText(frame, "DROWSINESS ALERT!", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         else:
-            COUNTER = 0
-            alarm_status = False
+            if not alarm_status2:  # Only reset counter if yawn alarm isn't active
+                COUNTER = 0
+                alarm_status = False
 
-        # Yawn detection (independent of EAR)
+        # Yawn detection
         if distance > YAWN_THRESHOLD:
             cv2.putText(frame, "Yawn Alert", (10, 60),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             if not alarm_status2:
                 alarm_status2 = True
-                t = Thread(target=alarm)
-                t.daemon = True
-                t.start()
         else:
-            alarm_status2 = False
+            if not alarm_status: 
+                alarm_status2 = False
 
         # Display metrics
         cv2.putText(frame, "EAR: {:.2f}".format(ear), (300, 30),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         cv2.putText(frame, "YAWN: {:.2f}".format(distance), (300, 60),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Display clap count if alarms are active
+        if alarm_status or alarm_status2:
+            cv2.putText(frame, f"Claps: {clap_count}/{CLAP_THRESHOLD}", (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # Always show current audio level for debugging
+        audio_level = prev_energy / clap_threshold  # Normalized to threshold
+        level_width = int(100 * audio_level)
+        cv2.rectangle(frame, (10, 120), (10 + level_width, 130), (0, 255, 255), -1)
+        cv2.putText(frame, f"Audio: {prev_energy:.3f}/{clap_threshold:.3f}", (120, 130),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
     cv2.imshow("Drowsiness Detector", frame)
             
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
             
+# Clean up
 cap.release()
+audio_stream.stop_stream()
+audio_stream.close()
+p.terminate()
 cv2.destroyAllWindows()
